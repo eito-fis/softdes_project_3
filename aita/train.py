@@ -1,10 +1,18 @@
 import wandb
 import pickle
 import numpy as np
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.pipeline import Pipeline
+from imblearn.under_sampling import EditedNearestNeighbours
 
 class AITA_Net(nn.Module):
     def __init__(self,
@@ -29,9 +37,11 @@ class AITA_Net(nn.Module):
             self.embedding = nn.Embedding.from_pretrained(embedding_weights,
                                                           freeze=freeze_embedding)
             embedding_dim = embedding_data.shape[1]
+
+        self.dropout = nn.Dropout(drop_prob)
+        if n_layers == 1: drop_prob = 0
         self.lstm = nn.LSTM(embedding_dim, hidden_dim, n_layers,
                             dropout=drop_prob, batch_first=True)
-        self.dropout = nn.Dropout(drop_prob)
         self.fc = nn.Linear(hidden_dim, output_size)
         self.sigmoid = nn.Sigmoid()
 
@@ -74,7 +84,7 @@ def build_model(word2idx, embeddings):
     vocab_size = len(word2idx) + 1
     output_size = 1
     embedding_dim = 512
-    hidden_dim = 512
+    hidden_dim = 256
     n_layers = 1
     model = AITA_Net(vocab_size,
                      embedding_dim,
@@ -83,23 +93,48 @@ def build_model(word2idx, embeddings):
                      n_layers,
                      embedding_data=embeddings)
     lr = 0.005
+    penalty = 0.0001
     bce = nn.BCELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=penalty)
     return model, bce, optimizer
 
-def build_loaders(titles, labels, batch_size):
-    dataset = TensorDataset(torch.from_numpy(titles), torch.from_numpy(labels))
+def calc_ratio(labels):
+    t = sum(labels)
+    f = len(labels) - t
+    ratio = t / f
+    print(f"True Examples: {t} |  False Examples: {f}")
+    print(f"Ratio: {ratio}")
 
-    dataset_size = len(titles)
-    train_proportion = 0.8
-    test_proportion = 0.1
+def build_loaders(titles, labels, batch_size,
+                  under_sample=False, over_sample=False):
+    train_titles, test_titles, train_labels, test_labels = \
+        train_test_split(titles, labels, test_size=0.1)
+    val_titles, test_titles, val_labels, test_labels = \
+        train_test_split(test_titles, test_labels, test_size=0.01)
 
-    train_size = int(dataset_size * train_proportion)
-    test_size = int(dataset_size * test_proportion)
-    val_size = int(dataset_size - train_size - test_size)
-    split = [train_size, test_size, val_size]
+    steps = []
+    if under_sample:
+        steps.append(("Under", EditedNearestNeighbours(n_neighbors=2)))
+    if over_sample:
+        steps.append(("Over", SMOTE(sampling_strategy=1)))
+    if under_sample or over_sample:
+        pipeline = Pipeline(steps=steps)
+        train_titles, train_labels = pipeline.fit_resample(train_titles,
+                                                           train_labels)
+    print("Train:")
+    calc_ratio(train_labels)
+    print("Validation:")
+    calc_ratio(val_labels)
+    print("Test:")
+    calc_ratio(test_labels)
 
-    train, test, val = torch.utils.data.random_split(dataset, split)
+    train = TensorDataset(torch.from_numpy(train_titles),
+                          torch.from_numpy(train_labels))
+    val = TensorDataset(torch.from_numpy(val_titles),
+                        torch.from_numpy(val_labels))
+    test = TensorDataset(torch.from_numpy(test_titles),
+                         torch.from_numpy(test_labels))
+
     train_loader = DataLoader(train, shuffle=True, batch_size=batch_size,
                               drop_last=True)
     test_loader = DataLoader(test, shuffle=True, batch_size=batch_size,
@@ -110,7 +145,6 @@ def build_loaders(titles, labels, batch_size):
     return train_loader, test_loader, val_loader
 
 def main():
-
     data = unpack_data('processed_dataset.pickle')
     titles, labels, vocab, word2idx, idx2word = data
     with open("embedding_matrix.pickle", 'rb') as of:
@@ -126,9 +160,9 @@ def main():
     wandb.init(project="aita_classifier")
     wandb.watch(model)
 
-    epochs = 20
+    epochs = 100
     counter = 0
-    log_period = 25
+    log_period = 100
     clip = 5
     val_loss_min = np.Inf
 
@@ -136,6 +170,7 @@ def main():
     for e in range(epochs):
         train_num_correct = 0
         train_num_pred = 0
+        train_auc = []
         train_losses = []
         for titles, labels in train_loader:
             counter += 1
@@ -147,68 +182,77 @@ def main():
             output = model(titles)
             loss = bce(output, labels.float())
 
-            # Save values for loggin
-            prediction = torch.round(output)
-            correct = prediction.eq(labels.float().view_as(prediction))
-            correct = np.squeeze(correct.numpy())
-            train_num_correct += np.sum(correct)
-            train_num_pred += output.size(0)
-            train_losses.append(loss.item())
-
             # Calculate, clip and apply gradient
             loss.backward()
-            nn.utils.clip_grad_norm(model.parameters(), clip)
+            # nn.utils.clip_grad_norm(model.parameters(), clip)
             optimizer.step()
+
+            with torch.no_grad():
+                # Save values for loggin
+                prediction = torch.round(output)
+                labels = labels.float().view_as(prediction)
+                train_auc.append(roc_auc_score(labels, output.detach()))
+                correct = prediction.eq(labels)
+                correct = np.squeeze(correct.numpy())
+                train_num_correct += np.sum(correct)
+                train_num_pred += output.size(0)
+                train_losses.append(loss.item())
 
             if counter % log_period == 0:
                 validation_losses = []
                 val_num_correct = 0
                 val_num_pred = 0
+                val_auc = []
                 model.eval()
-                for v_titles, v_labels in val_loader:
-                    model.hidden = model.init_hidden(batch_size)
-                    output = model(v_titles)
-                    loss = bce(output, v_labels.float())
-                    validation_losses.append(loss.item())
+                print("Validating...")
+                for v_titles, v_labels in tqdm(val_loader):
+                    with torch.no_grad():
+                        model.hidden = model.init_hidden(batch_size)
+                        output = model(v_titles)
+                        loss = bce(output, v_labels.float())
+                        validation_losses.append(loss.item())
 
-                    prediction = torch.round(output)
-                    correct = prediction.eq(labels.float().view_as(prediction))
-                    correct = np.squeeze(correct.numpy())
-                    val_num_correct += np.sum(correct)
-                    val_num_pred += output.size(0)
+                        prediction = torch.round(output)
+                        labels = labels.float().view_as(prediction)
+                        val_auc.append(roc_auc_score(labels, output.detach()))
+                        correct = prediction.eq(labels)
+                        correct = np.squeeze(correct.numpy())
+                        val_num_correct += np.sum(correct)
+                        val_num_pred += output.size(0)
                 model.train()
 
                 avg_val_loss = np.mean(validation_losses)
                 val_accuracy = val_num_correct / val_num_pred
+                avg_val_auc = np.mean(val_auc)
                 avg_train_loss = np.mean(train_losses)
                 train_accuracy = train_num_correct / train_num_pred
-                print("-" * 30)
+                avg_train_auc = np.mean(train_auc)
                 print(f"Epoch: {e} | Step: {counter}")
-                print(f"Train Accuracy: {train_accuracy}")
-                print(f"Train Loss: {avg_train_loss}")
-                print(f"Validation Accuracy: {val_accuracy}")
-                print(f"Validation Loss: {avg_val_loss:.6f}")
+                print(f"Train Accuracy: {train_accuracy:.6f} | Validation Accuracy: {val_accuracy:.6f}")
+                print(f"Train Loss: {avg_train_loss:.6f} |  Validation Loss: {avg_val_loss:.6f}")
+                print(f"Train AUCROC: {avg_train_auc:.6f} | Validation AUCROC: {avg_val_auc:.6f}")
 
                 wandb.log({"Train Accuracy": train_accuracy,
                            "Train Loss": avg_train_loss,
+                           "Train AUC": avg_train_auc,
                            "Validation Accuracy": val_accuracy,
                            "Validation Loss": avg_val_loss,
+                           "Validation AUC": avg_val_auc,
                            "Step": counter})
 
                 if avg_val_loss < val_loss_min:
+                    print("Validation loss decreased! Saving model...")
+                    print(f"Loss decreased from {val_loss_min:.6f} to {avg_val_loss:.6f}")
                     torch.save(model.state_dict(),
-                               f'model_data/state_dict_{e}_{counter}.pt')
-                    torch.save(optimizer.state_dict(),
-                               f'model_data/optimizer_{e}_{counter}.pth')
-                    print(f"""Validation loss decreased:
-                          ({val_loss_min:.6f} --> {avg_val_loss:.6f})""")
-                    print("Saved new model")
+                               f'model_data/best_state_dict_{e}_{counter}.pt')
                     val_loss_min = avg_val_loss
+                print("")
 
                 # Reset average loggin metrics
                 train_num_correct = 0
                 train_num_pred = 0
                 train_loss = []
+                train_auc = []
 
 if __name__ == "__main__":
     main()
